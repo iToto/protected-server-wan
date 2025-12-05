@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:pkg.go.dev)",
+      "WebFetch(domain:github.com)",
+      "Bash(go mod init:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(go build:*)",
+      "Bash(./protect-wan:*)",
+      "Bash(make help:*)",
+      "Bash(make clean:*)",
+      "Bash(make build:*)",
+      "Bash(make check:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
