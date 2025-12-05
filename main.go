@@ -267,11 +267,18 @@ func autoSelectMullvad(ctx context.Context, lc *tailscale.LocalClient) error {
 		// Use smart two-phase latency selection
 		testedNodes := smartLatencySelection(ctx, lc, onlineNodes)
 
-		if len(testedNodes) == 0 {
-			return fmt.Errorf("no nodes responded to latency tests")
+		if len(testedNodes) == 0 || testedNodes[0].Latency == 0 {
+			// All pings failed - fallback to priority-based selection
+			fmt.Println("\n⚠️  Warning: All latency tests failed. Falling back to priority-based selection.")
+			fmt.Println("   This may indicate:")
+			fmt.Println("   - Firewall blocking Tailscale ping packets")
+			fmt.Println("   - Tailscale daemon issues")
+			fmt.Println("   - Network configuration problems")
+			fmt.Println("\n   Selecting by Tailscale priority instead...")
+			bestNode = onlineNodes[0]
+		} else {
+			bestNode = testedNodes[0]
 		}
-
-		bestNode = testedNodes[0]
 	} else {
 		// Use priority-based selection (no latency testing)
 		bestNode = onlineNodes[0]
@@ -382,30 +389,33 @@ func clearExitNode(ctx context.Context, lc *tailscale.LocalClient) error {
 // pingNode measures the latency to a Mullvad exit node
 func pingNode(ctx context.Context, lc *tailscale.LocalClient, node *MullvadNode) time.Duration {
 	if len(node.TailscaleIPs) == 0 {
+		if *verboseFlag {
+			fmt.Printf("  %s: No Tailscale IP available\n", strings.TrimSuffix(node.DNSName, "."))
+		}
 		return time.Duration(0) // No IP available
 	}
 
 	// Use the first Tailscale IP
 	targetIP := node.TailscaleIPs[0]
 
-	// Create a timeout context (2 seconds for each ping)
-	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	// Create a timeout context (5 seconds for each ping - increased for better reliability)
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	// Perform disco ping (tests connectivity)
 	result, err := lc.Ping(pingCtx, targetIP, tailcfg.PingDisco)
 	if err != nil {
-		if *verboseFlag {
-			fmt.Printf("  Ping to %s failed: %v\n", strings.TrimSuffix(node.DNSName, "."), err)
-		}
+		// Always show first few errors to help diagnose issues
+		fmt.Printf("  %s (%s): Ping failed - %v\n",
+			strings.TrimSuffix(node.DNSName, "."),
+			targetIP.String(),
+			err)
 		return time.Duration(0) // Failed ping
 	}
 
 	// Check for ping errors
 	if result.Err != "" {
-		if *verboseFlag {
-			fmt.Printf("  Ping to %s error: %s\n", strings.TrimSuffix(node.DNSName, "."), result.Err)
-		}
+		fmt.Printf("  %s: %s\n", strings.TrimSuffix(node.DNSName, "."), result.Err)
 		return time.Duration(0)
 	}
 
@@ -413,7 +423,9 @@ func pingNode(ctx context.Context, lc *tailscale.LocalClient, node *MullvadNode)
 	latency := time.Duration(result.LatencySeconds * float64(time.Second))
 
 	if *verboseFlag {
-		fmt.Printf("  Ping to %s: %v\n", strings.TrimSuffix(node.DNSName, "."), latency.Round(time.Millisecond))
+		fmt.Printf("  %s: %v ✓\n", strings.TrimSuffix(node.DNSName, "."), latency.Round(time.Millisecond))
+	} else {
+		fmt.Printf("  %s: %v\n", strings.TrimSuffix(node.DNSName, "."), latency.Round(time.Millisecond))
 	}
 
 	return latency
