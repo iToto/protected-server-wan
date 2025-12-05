@@ -260,30 +260,22 @@ func autoSelectMullvad(ctx context.Context, lc *tailscale.LocalClient) error {
 		return fmt.Errorf("no online Mullvad exit nodes found")
 	}
 
+	var bestNode MullvadNode
+
 	// Test latency unless --prefer-priority is specified
 	if !*preferPriority {
-		onlineNodes = testLatencyForNodes(ctx, lc, onlineNodes, 5)
+		// Use smart two-phase latency selection
+		testedNodes := smartLatencySelection(ctx, lc, onlineNodes)
 
-		// Re-sort by latency (lower is better), excluding nodes with 0 latency (failed pings)
-		sort.Slice(onlineNodes, func(i, j int) bool {
-			// Nodes with 0 latency (failed/untested) go to the end
-			if onlineNodes[i].Latency == 0 && onlineNodes[j].Latency != 0 {
-				return false
-			}
-			if onlineNodes[i].Latency != 0 && onlineNodes[j].Latency == 0 {
-				return true
-			}
-			// Both have valid latency, compare them
-			if onlineNodes[i].Latency != 0 && onlineNodes[j].Latency != 0 {
-				return onlineNodes[i].Latency < onlineNodes[j].Latency
-			}
-			// Both are 0, fall back to priority
-			return onlineNodes[i].Priority < onlineNodes[j].Priority
-		})
+		if len(testedNodes) == 0 {
+			return fmt.Errorf("no nodes responded to latency tests")
+		}
+
+		bestNode = testedNodes[0]
+	} else {
+		// Use priority-based selection (no latency testing)
+		bestNode = onlineNodes[0]
 	}
-
-	// Select the best node
-	bestNode := onlineNodes[0]
 
 	if *verboseFlag {
 		fmt.Printf("\nSelected Mullvad node:\n")
@@ -449,6 +441,157 @@ func testLatencyForNodes(ctx context.Context, lc *tailscale.LocalClient, nodes [
 	}
 
 	return nodes
+}
+
+// CountryGroup represents nodes grouped by country
+type CountryGroup struct {
+	CountryCode string
+	Country     string
+	Nodes       []MullvadNode
+	BestLatency time.Duration // Best latency from this country
+}
+
+// groupNodesByCountry groups Mullvad nodes by country code
+func groupNodesByCountry(nodes []MullvadNode) map[string]*CountryGroup {
+	groups := make(map[string]*CountryGroup)
+
+	for _, node := range nodes {
+		if _, exists := groups[node.CountryCode]; !exists {
+			groups[node.CountryCode] = &CountryGroup{
+				CountryCode: node.CountryCode,
+				Country:     node.Country,
+				Nodes:       []MullvadNode{},
+			}
+		}
+		groups[node.CountryCode].Nodes = append(groups[node.CountryCode].Nodes, node)
+	}
+
+	return groups
+}
+
+// testCountryLatency tests one representative node from each country
+// Returns a slice of countries sorted by their best latency
+func testCountryLatency(ctx context.Context, lc *tailscale.LocalClient, countryGroups map[string]*CountryGroup) []*CountryGroup {
+	if *verboseFlag {
+		fmt.Printf("\nPhase 1: Testing one node from each country (%d countries)...\n", len(countryGroups))
+	}
+
+	var countries []*CountryGroup
+
+	for _, group := range countryGroups {
+		// Test the highest priority (first) node from this country
+		if len(group.Nodes) > 0 {
+			testNode := &group.Nodes[0]
+			latency := pingNode(ctx, lc, testNode)
+			testNode.Latency = latency
+			group.BestLatency = latency
+
+			if *verboseFlag && latency > 0 {
+				fmt.Printf("  %s (%s): %v\n", group.Country, group.CountryCode, latency.Round(time.Millisecond))
+			}
+		}
+		countries = append(countries, group)
+	}
+
+	// Sort countries by best latency
+	sort.Slice(countries, func(i, j int) bool {
+		// Countries with 0 latency (failed) go to the end
+		if countries[i].BestLatency == 0 && countries[j].BestLatency != 0 {
+			return false
+		}
+		if countries[i].BestLatency != 0 && countries[j].BestLatency == 0 {
+			return true
+		}
+		// Both have valid latency
+		if countries[i].BestLatency != 0 && countries[j].BestLatency != 0 {
+			return countries[i].BestLatency < countries[j].BestLatency
+		}
+		// Both failed, sort by country code
+		return countries[i].CountryCode < countries[j].CountryCode
+	})
+
+	return countries
+}
+
+// testTopCountriesInDepth tests the top N nodes in each of the top M countries
+func testTopCountriesInDepth(ctx context.Context, lc *tailscale.LocalClient, countries []*CountryGroup, topCountries int, nodesPerCountry int) []MullvadNode {
+	var allNodes []MullvadNode
+
+	// Limit to topCountries
+	testCountryCount := len(countries)
+	if testCountryCount > topCountries {
+		testCountryCount = topCountries
+	}
+
+	if *verboseFlag {
+		fmt.Printf("\nPhase 2: Testing top %d nodes in each of the top %d countries...\n", nodesPerCountry, testCountryCount)
+	}
+
+	for i := 0; i < testCountryCount; i++ {
+		country := countries[i]
+
+		// Skip countries that failed initial test
+		if country.BestLatency == 0 {
+			continue
+		}
+
+		if *verboseFlag {
+			fmt.Printf("\nTesting nodes in %s (%s):\n", country.Country, country.CountryCode)
+		}
+
+		// Test up to nodesPerCountry nodes from this country
+		testCount := len(country.Nodes)
+		if testCount > nodesPerCountry {
+			testCount = nodesPerCountry
+		}
+
+		for j := 0; j < testCount; j++ {
+			node := &country.Nodes[j]
+
+			// Skip if already tested (first node was tested in phase 1)
+			if node.Latency == 0 {
+				node.Latency = pingNode(ctx, lc, node)
+			} else if *verboseFlag {
+				fmt.Printf("  %s: %v (from Phase 1)\n",
+					strings.TrimSuffix(node.DNSName, "."),
+					node.Latency.Round(time.Millisecond))
+			}
+
+			allNodes = append(allNodes, *node)
+		}
+	}
+
+	// Sort all tested nodes by latency
+	sort.Slice(allNodes, func(i, j int) bool {
+		if allNodes[i].Latency == 0 && allNodes[j].Latency != 0 {
+			return false
+		}
+		if allNodes[i].Latency != 0 && allNodes[j].Latency == 0 {
+			return true
+		}
+		if allNodes[i].Latency != 0 && allNodes[j].Latency != 0 {
+			return allNodes[i].Latency < allNodes[j].Latency
+		}
+		return allNodes[i].Priority < allNodes[j].Priority
+	})
+
+	return allNodes
+}
+
+// smartLatencySelection performs two-phase latency testing:
+// Phase 1: Test one node per country
+// Phase 2: Deep test top nodes in fastest countries
+func smartLatencySelection(ctx context.Context, lc *tailscale.LocalClient, nodes []MullvadNode) []MullvadNode {
+	// Group nodes by country
+	countryGroups := groupNodesByCountry(nodes)
+
+	// Phase 1: Test one node from each country
+	sortedCountries := testCountryLatency(ctx, lc, countryGroups)
+
+	// Phase 2: Deep test top 5 nodes in top 5 countries
+	testedNodes := testTopCountriesInDepth(ctx, lc, sortedCountries, 5, 5)
+
+	return testedNodes
 }
 
 // handlePermissionError checks if the error is permission-related and provides helpful guidance

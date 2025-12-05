@@ -146,11 +146,23 @@ Run without flags to automatically check and protect your WAN:
 
 ### Selection Algorithm
 
-**Default Behavior (Latency-Based):**
-- Tests the top 5 Mullvad exit nodes by Tailscale priority
-- Measures round-trip latency using Tailscale's native ping
-- Selects the node with the lowest latency
-- Provides the best actual performance
+**Default Behavior (Smart Two-Phase Latency Testing):**
+
+**Phase 1: Country-Level Survey**
+- Groups all Mullvad nodes by country
+- Pings one representative node (highest priority) from each country
+- Identifies the fastest countries based on latency
+
+**Phase 2: Deep Country Testing**
+- Selects the top 5 fastest countries from Phase 1
+- Tests the top 5 priority nodes within each of those countries
+- Selects the single fastest node across all tested nodes
+
+**Benefits:**
+- Efficient: Avoids testing many nodes in distant countries
+- Comprehensive: Ensures you find the truly optimal node
+- Smart: Focuses deep testing on countries that are actually fast
+- Typical test count: ~10-30 pings (1 per country + 5x5 for top countries)
 
 **With `--prefer-priority` Flag:**
 - Selects based on Tailscale's geographic priority score
@@ -209,19 +221,47 @@ Testing latency for top 5 nodes by priority...
 WAN is now protected via us-nyc-wg-301.mullvad.ts.net (New York City, US) - Latency: 23ms
 ```
 
-With verbose mode to see latency tests:
+With verbose mode to see the two-phase selection process:
 ```bash
 ./protect-wan --auto --verbose
 ```
 
 Output:
 ```
-Testing latency for top 5 nodes by priority...
-  Ping to us-nyc-wg-301.mullvad.ts.net: 23ms
-  Ping to us-lax-wg-102.mullvad.ts.net: 45ms
+Phase 1: Testing one node from each country (12 countries)...
+  United States (US): 23ms
+  Canada (CA): 45ms
+  United Kingdom (GB): 89ms
+  Switzerland (CH): 156ms
+  Sweden (SE): 178ms
+  Germany (DE): 142ms
+  Japan (JP): 234ms
+  Australia (AU): 298ms
+  Singapore (SG): 267ms
+  Netherlands (NL): 134ms
+  France (FR): 147ms
+  Spain (ES): 165ms
+
+Phase 2: Testing top 5 nodes in each of the top 5 countries...
+
+Testing nodes in United States (US):
+  us-nyc-wg-301.mullvad.ts.net: 23ms (from Phase 1)
   Ping to us-chi-wg-201.mullvad.ts.net: 18ms
+  Ping to us-lax-wg-102.mullvad.ts.net: 45ms
   Ping to us-sea-wg-104.mullvad.ts.net: 67ms
   Ping to us-atl-wg-108.mullvad.ts.net: 32ms
+
+Testing nodes in Canada (CA):
+  ca-tor-wg-001.mullvad.ts.net: 45ms (from Phase 1)
+  Ping to ca-van-wg-001.mullvad.ts.net: 71ms
+  Ping to ca-mon-wg-002.mullvad.ts.net: 38ms
+
+Testing nodes in Netherlands (NL):
+  nl-ams-wg-101.mullvad.ts.net: 134ms (from Phase 1)
+  Ping to nl-ams-wg-102.mullvad.ts.net: 131ms
+  Ping to nl-ams-wg-201.mullvad.ts.net: 135ms
+
+...
 
 Selected Mullvad node:
   Hostname: us-chi-wg-201.mullvad.ts.net
@@ -293,16 +333,23 @@ Add `--verbose` to any command for detailed logging:
 
 3. **Mullvad Node Discovery**: Retrieves all peers from Tailscale status and filters for nodes with DNS names ending in `.mullvad.ts.net.`
 
-4. **Best Node Selection** (default latency-based):
+4. **Best Node Selection** (default two-phase latency testing):
    - Filters for **online nodes only**
-   - Sorts by **Tailscale priority** (lower number = geographically closer)
    - Optionally filters by **country code**
-   - **Tests latency** for the top 5 candidates using Tailscale's native ping (PingDisco)
-   - Re-sorts by **measured latency** (lower = faster)
-   - Selects the node with the **lowest latency**
 
-   With `--prefer-priority` flag (legacy behavior):
-   - Skips latency testing
+   **Phase 1: Country-Level Survey**
+   - Groups nodes by country
+   - Tests one representative node per country using Tailscale's native ping (PingDisco)
+   - Sorts countries by latency
+
+   **Phase 2: Deep Country Testing**
+   - Selects top 5 fastest countries from Phase 1
+   - Tests top 5 priority nodes in each of those countries (up to 25 nodes)
+   - Sorts all tested nodes by latency
+   - Selects the node with the **lowest measured latency**
+
+   With `--prefer-priority` flag (instant selection):
+   - Skips all latency testing
    - Selects the first node by Tailscale priority
 
 5. **Exit Node Activation**: Uses `EditPrefs` with `MaskedPrefs` to set the `ExitNodeID` preference
