@@ -11,7 +11,8 @@
       "Bash(make help:*)",
       "Bash(make clean:*)",
       "Bash(make build:*)",
-      "Bash(make check:*)"
+      "Bash(make check:*)",
+      "WebFetch(domain:tailscale.com)"
     ],
     "deny": [],
     "ask": []

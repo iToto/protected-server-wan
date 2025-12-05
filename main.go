@@ -5,9 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"tailscale.com/client/tailscale"
 	"tailscale.com/ipn"
@@ -15,24 +17,27 @@ import (
 )
 
 var (
-	checkFlag   = flag.Bool("check", false, "Only check current exit node status and exit")
-	setFlag     = flag.String("set", "", "Set specific exit node by ID or hostname")
-	listFlag    = flag.Bool("list", false, "List all available Mullvad exit nodes")
-	countryFlag = flag.String("country", "", "Filter Mullvad nodes by country code (e.g., US, CH, SE)")
-	autoFlag    = flag.Bool("auto", false, "Auto-select best Mullvad exit node")
-	disableFlag = flag.Bool("disable", false, "Disable exit node")
-	verboseFlag = flag.Bool("verbose", false, "Enable detailed logging")
+	checkFlag       = flag.Bool("check", false, "Only check current exit node status and exit")
+	setFlag         = flag.String("set", "", "Set specific exit node by ID or hostname")
+	listFlag        = flag.Bool("list", false, "List all available Mullvad exit nodes")
+	countryFlag     = flag.String("country", "", "Filter Mullvad nodes by country code (e.g., US, CH, SE)")
+	autoFlag        = flag.Bool("auto", false, "Auto-select best Mullvad exit node")
+	disableFlag     = flag.Bool("disable", false, "Disable exit node")
+	verboseFlag     = flag.Bool("verbose", false, "Enable detailed logging")
+	preferPriority  = flag.Bool("prefer-priority", false, "Select by Tailscale priority instead of latency (faster but may not be optimal)")
 )
 
 type MullvadNode struct {
-	ID          tailcfg.StableNodeID
-	DNSName     string
-	Country     string
-	CountryCode string
-	City        string
-	CityCode    string
-	Priority    int
-	Online      bool
+	ID           tailcfg.StableNodeID
+	DNSName      string
+	Country      string
+	CountryCode  string
+	City         string
+	CityCode     string
+	Priority     int
+	Online       bool
+	TailscaleIPs []netip.Addr // Tailscale IP addresses for pinging
+	Latency      time.Duration // Measured latency (0 if not tested)
 }
 
 func main() {
@@ -186,9 +191,10 @@ func getMullvadNodes(ctx context.Context, lc *tailscale.LocalClient) ([]MullvadN
 		// Check if this is a Mullvad exit node
 		if peer.ExitNodeOption && strings.HasSuffix(peer.DNSName, ".mullvad.ts.net.") {
 			node := MullvadNode{
-				ID:      peer.ID,
-				DNSName: peer.DNSName,
-				Online:  peer.Online,
+				ID:           peer.ID,
+				DNSName:      peer.DNSName,
+				Online:       peer.Online,
+				TailscaleIPs: peer.TailscaleIPs,
 			}
 
 			if peer.Location != nil {
@@ -254,14 +260,39 @@ func autoSelectMullvad(ctx context.Context, lc *tailscale.LocalClient) error {
 		return fmt.Errorf("no online Mullvad exit nodes found")
 	}
 
-	// Select the best node (already sorted by priority)
+	// Test latency unless --prefer-priority is specified
+	if !*preferPriority {
+		onlineNodes = testLatencyForNodes(ctx, lc, onlineNodes, 5)
+
+		// Re-sort by latency (lower is better), excluding nodes with 0 latency (failed pings)
+		sort.Slice(onlineNodes, func(i, j int) bool {
+			// Nodes with 0 latency (failed/untested) go to the end
+			if onlineNodes[i].Latency == 0 && onlineNodes[j].Latency != 0 {
+				return false
+			}
+			if onlineNodes[i].Latency != 0 && onlineNodes[j].Latency == 0 {
+				return true
+			}
+			// Both have valid latency, compare them
+			if onlineNodes[i].Latency != 0 && onlineNodes[j].Latency != 0 {
+				return onlineNodes[i].Latency < onlineNodes[j].Latency
+			}
+			// Both are 0, fall back to priority
+			return onlineNodes[i].Priority < onlineNodes[j].Priority
+		})
+	}
+
+	// Select the best node
 	bestNode := onlineNodes[0]
 
 	if *verboseFlag {
-		fmt.Printf("Selected Mullvad node:\n")
+		fmt.Printf("\nSelected Mullvad node:\n")
 		fmt.Printf("  Hostname: %s\n", strings.TrimSuffix(bestNode.DNSName, "."))
 		fmt.Printf("  Location: %s, %s\n", bestNode.City, bestNode.CountryCode)
 		fmt.Printf("  Priority: %d\n", bestNode.Priority)
+		if bestNode.Latency > 0 {
+			fmt.Printf("  Latency: %v\n", bestNode.Latency.Round(time.Millisecond))
+		}
 		fmt.Printf("  Online: %v\n", bestNode.Online)
 	}
 
@@ -270,10 +301,19 @@ func autoSelectMullvad(ctx context.Context, lc *tailscale.LocalClient) error {
 		return err
 	}
 
-	fmt.Printf("WAN is now protected via %s (%s, %s)\n",
-		strings.TrimSuffix(bestNode.DNSName, "."),
-		bestNode.City,
-		bestNode.CountryCode)
+	// Show latency in output if available
+	if bestNode.Latency > 0 {
+		fmt.Printf("WAN is now protected via %s (%s, %s) - Latency: %v\n",
+			strings.TrimSuffix(bestNode.DNSName, "."),
+			bestNode.City,
+			bestNode.CountryCode,
+			bestNode.Latency.Round(time.Millisecond))
+	} else {
+		fmt.Printf("WAN is now protected via %s (%s, %s)\n",
+			strings.TrimSuffix(bestNode.DNSName, "."),
+			bestNode.City,
+			bestNode.CountryCode)
+	}
 
 	return nil
 }
@@ -345,6 +385,70 @@ func clearExitNode(ctx context.Context, lc *tailscale.LocalClient) error {
 	}
 
 	return nil
+}
+
+// pingNode measures the latency to a Mullvad exit node
+func pingNode(ctx context.Context, lc *tailscale.LocalClient, node *MullvadNode) time.Duration {
+	if len(node.TailscaleIPs) == 0 {
+		return time.Duration(0) // No IP available
+	}
+
+	// Use the first Tailscale IP
+	targetIP := node.TailscaleIPs[0]
+
+	// Create a timeout context (2 seconds for each ping)
+	pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	// Perform disco ping (tests connectivity)
+	result, err := lc.Ping(pingCtx, targetIP, tailcfg.PingDisco)
+	if err != nil {
+		if *verboseFlag {
+			fmt.Printf("  Ping to %s failed: %v\n", strings.TrimSuffix(node.DNSName, "."), err)
+		}
+		return time.Duration(0) // Failed ping
+	}
+
+	// Check for ping errors
+	if result.Err != "" {
+		if *verboseFlag {
+			fmt.Printf("  Ping to %s error: %s\n", strings.TrimSuffix(node.DNSName, "."), result.Err)
+		}
+		return time.Duration(0)
+	}
+
+	// Convert latency from seconds to duration
+	latency := time.Duration(result.LatencySeconds * float64(time.Second))
+
+	if *verboseFlag {
+		fmt.Printf("  Ping to %s: %v\n", strings.TrimSuffix(node.DNSName, "."), latency.Round(time.Millisecond))
+	}
+
+	return latency
+}
+
+// testLatencyForNodes tests latency for the top N nodes
+func testLatencyForNodes(ctx context.Context, lc *tailscale.LocalClient, nodes []MullvadNode, maxNodes int) []MullvadNode {
+	if len(nodes) == 0 {
+		return nodes
+	}
+
+	// Limit to maxNodes
+	testCount := len(nodes)
+	if testCount > maxNodes {
+		testCount = maxNodes
+	}
+
+	if *verboseFlag {
+		fmt.Printf("Testing latency for top %d nodes by priority...\n", testCount)
+	}
+
+	// Test latency for each node
+	for i := 0; i < testCount; i++ {
+		nodes[i].Latency = pingNode(ctx, lc, &nodes[i])
+	}
+
+	return nodes
 }
 
 // handlePermissionError checks if the error is permission-related and provides helpful guidance

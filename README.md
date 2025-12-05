@@ -140,8 +140,23 @@ Run without flags to automatically check and protect your WAN:
 --country <code>     Filter Mullvad nodes by country code (e.g., US, CH, SE)
 --auto               Auto-select and set the best Mullvad exit node
 --disable            Disable/clear the current exit node
+--prefer-priority    Select by Tailscale priority instead of latency (faster but may not be optimal)
 --verbose            Enable detailed logging
 ```
+
+### Selection Algorithm
+
+**Default Behavior (Latency-Based):**
+- Tests the top 5 Mullvad exit nodes by Tailscale priority
+- Measures round-trip latency using Tailscale's native ping
+- Selects the node with the lowest latency
+- Provides the best actual performance
+
+**With `--prefer-priority` Flag:**
+- Selects based on Tailscale's geographic priority score
+- No latency testing (faster selection, ~instant)
+- Uses Tailscale's calculated priority based on proximity
+- Good for quick selections or when latency testing is undesirable
 
 ### Examples
 
@@ -182,13 +197,49 @@ se-sto-wg-005.mullvad.ts.net            Stockholm, SE        Yes      12
 ./protect-wan --list --country SE
 ```
 
-#### Auto-Select Best Mullvad Node
+#### Auto-Select Best Mullvad Node (Latency-Based)
 
 ```bash
 ./protect-wan --auto
 ```
 
+Output (with latency testing):
+```
+Testing latency for top 5 nodes by priority...
+WAN is now protected via us-nyc-wg-301.mullvad.ts.net (New York City, US) - Latency: 23ms
+```
+
+With verbose mode to see latency tests:
+```bash
+./protect-wan --auto --verbose
+```
+
 Output:
+```
+Testing latency for top 5 nodes by priority...
+  Ping to us-nyc-wg-301.mullvad.ts.net: 23ms
+  Ping to us-lax-wg-102.mullvad.ts.net: 45ms
+  Ping to us-chi-wg-201.mullvad.ts.net: 18ms
+  Ping to us-sea-wg-104.mullvad.ts.net: 67ms
+  Ping to us-atl-wg-108.mullvad.ts.net: 32ms
+
+Selected Mullvad node:
+  Hostname: us-chi-wg-201.mullvad.ts.net
+  Location: Chicago, US
+  Priority: 10
+  Latency: 18ms
+  Online: true
+
+WAN is now protected via us-chi-wg-201.mullvad.ts.net (Chicago, US) - Latency: 18ms
+```
+
+#### Auto-Select by Priority (Faster, No Latency Testing)
+
+```bash
+./protect-wan --auto --prefer-priority
+```
+
+Output (instant selection):
 ```
 WAN is now protected via us-nyc-wg-301.mullvad.ts.net (New York City, US)
 ```
@@ -199,7 +250,7 @@ WAN is now protected via us-nyc-wg-301.mullvad.ts.net (New York City, US)
 ./protect-wan --auto --country CH
 ```
 
-This will select the best (lowest priority, online) Mullvad exit node in Switzerland.
+This will test latency for the top 5 Mullvad exit nodes in Switzerland and select the fastest.
 
 #### Set Specific Exit Node
 
@@ -242,11 +293,17 @@ Add `--verbose` to any command for detailed logging:
 
 3. **Mullvad Node Discovery**: Retrieves all peers from Tailscale status and filters for nodes with DNS names ending in `.mullvad.ts.net.`
 
-4. **Best Node Selection**:
+4. **Best Node Selection** (default latency-based):
    - Filters for **online nodes only**
-   - Sorts by **priority** (lower number = better)
+   - Sorts by **Tailscale priority** (lower number = geographically closer)
    - Optionally filters by **country code**
-   - Selects the first matching node
+   - **Tests latency** for the top 5 candidates using Tailscale's native ping (PingDisco)
+   - Re-sorts by **measured latency** (lower = faster)
+   - Selects the node with the **lowest latency**
+
+   With `--prefer-priority` flag (legacy behavior):
+   - Skips latency testing
+   - Selects the first node by Tailscale priority
 
 5. **Exit Node Activation**: Uses `EditPrefs` with `MaskedPrefs` to set the `ExitNodeID` preference
 
