@@ -289,7 +289,7 @@ func setExitNode(ctx context.Context, lc *tailscale.LocalClient, nodeID tailcfg.
 
 	_, err := lc.EditPrefs(ctx, mp)
 	if err != nil {
-		return fmt.Errorf("failed to set exit node: %w", err)
+		return handlePermissionError(err, "set exit node")
 	}
 
 	if *verboseFlag {
@@ -337,7 +337,7 @@ func clearExitNode(ctx context.Context, lc *tailscale.LocalClient) error {
 
 	_, err := lc.EditPrefs(ctx, mp)
 	if err != nil {
-		return fmt.Errorf("failed to clear exit node: %w", err)
+		return handlePermissionError(err, "clear exit node")
 	}
 
 	if *verboseFlag {
@@ -345,4 +345,41 @@ func clearExitNode(ctx context.Context, lc *tailscale.LocalClient) error {
 	}
 
 	return nil
+}
+
+// handlePermissionError checks if the error is permission-related and provides helpful guidance
+func handlePermissionError(err error, operation string) error {
+	errMsg := err.Error()
+
+	// Check for common permission-related error messages
+	if strings.Contains(errMsg, "Access denied") ||
+	   strings.Contains(errMsg, "permission denied") ||
+	   strings.Contains(errMsg, "prefs write access denied") {
+		return fmt.Errorf(`failed to %s: %w
+
+Permission denied. Tailscale preferences require elevated access.
+
+Try one of these solutions:
+
+1. Run with sudo:
+   sudo %s
+
+2. Run as the tailscale user (Linux):
+   sudo -u tailscale %s
+
+3. Grant your user access to Tailscale (Linux):
+   sudo usermod -a -G tailscale $USER
+   (then logout and login again)
+
+4. On macOS, ensure you're running as an admin user or use sudo
+
+5. Use the tailscale CLI directly as an alternative:
+   tailscale set --exit-node=<node-hostname>
+
+For more information, see: https://tailscale.com/kb/1103/exit-nodes`,
+			operation, err, os.Args[0], os.Args[0])
+	}
+
+	// Return the original error with context if it's not a permission error
+	return fmt.Errorf("failed to %s: %w", operation, err)
 }

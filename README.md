@@ -257,19 +257,76 @@ Add `--verbose` to any command for detailed logging:
 
 ## Permissions
 
-The program requires appropriate permissions to access the Tailscale daemon socket:
+The program requires appropriate permissions to access and modify Tailscale daemon preferences.
+
+### Permission Requirements
 
 - **Linux/macOS**: Must run as the same user as `tailscaled` or as root
 - **Windows**: Must run with Administrator privileges
 
-If you encounter permission errors:
+### Common Permission Error
+
+If you see this error:
+```
+Error auto-selecting Mullvad node: failed to set exit node: Access denied: prefs write access denied
+```
+
+This means your user doesn't have permission to modify Tailscale preferences.
+
+### Solutions
+
+#### 1. Run with sudo (Recommended for servers)
 
 ```bash
-# Linux/macOS - run with sudo
 sudo ./protect-wan
+sudo make auto
+```
 
-# Or change ownership (if tailscaled runs as specific user)
-sudo chown $(whoami) /var/run/tailscale/tailscaled.sock
+#### 2. Add your user to the tailscale group (Linux)
+
+```bash
+# Add user to tailscale group
+sudo usermod -a -G tailscale $USER
+
+# Logout and login again for changes to take effect
+# Or use newgrp:
+newgrp tailscale
+```
+
+#### 3. Run as the tailscale user (Linux)
+
+```bash
+sudo -u tailscale ./protect-wan
+```
+
+#### 4. Use make targets with sudo
+
+```bash
+sudo make auto
+sudo make disable
+sudo make run
+```
+
+#### 5. Install to /usr/local/bin and create a wrapper script
+
+```bash
+# Install the binary
+make install
+
+# Create a wrapper script that runs with appropriate permissions
+echo '#!/bin/bash' | sudo tee /usr/local/bin/protect-wan-sudo
+echo 'sudo /usr/local/bin/protect-wan "$@"' | sudo tee -a /usr/local/bin/protect-wan-sudo
+sudo chmod +x /usr/local/bin/protect-wan-sudo
+```
+
+### Checking Current Permissions
+
+To check if you have access without modifying anything:
+
+```bash
+# This only reads, doesn't require write permissions
+./protect-wan --check
+./protect-wan --list
 ```
 
 ## Troubleshooting
@@ -283,10 +340,7 @@ If you see "No Mullvad exit nodes found", ensure:
 
 ### Permission Denied
 
-If you get permission errors accessing the Tailscale socket:
-- Run with `sudo` (not recommended for production)
-- Ensure you're running as the same user as the `tailscaled` daemon
-- Check socket permissions: `ls -l /var/run/tailscale/tailscaled.sock`
+See the [Permissions](#permissions) section above for detailed solutions to permission-related errors.
 
 ### Exit Node Set But Not Working
 
