@@ -24,7 +24,6 @@ var (
 	autoFlag        = flag.Bool("auto", false, "Auto-select best Mullvad exit node")
 	disableFlag     = flag.Bool("disable", false, "Disable exit node")
 	verboseFlag     = flag.Bool("verbose", false, "Enable detailed logging")
-	preferPriority  = flag.Bool("prefer-priority", false, "Select by Tailscale priority instead of latency (faster but may not be optimal)")
 )
 
 type MullvadNode struct {
@@ -260,38 +259,32 @@ func autoSelectMullvad(ctx context.Context, lc *tailscale.LocalClient) error {
 		return fmt.Errorf("no online Mullvad exit nodes found")
 	}
 
-	var bestNode MullvadNode
-
-	// Test latency unless --prefer-priority is specified
-	if !*preferPriority {
-		// Use smart two-phase latency selection
-		testedNodes := smartLatencySelection(ctx, lc, onlineNodes)
-
-		if len(testedNodes) == 0 || testedNodes[0].Latency == 0 {
-			// All pings failed - fallback to priority-based selection
-			fmt.Println("\n⚠️  Warning: All latency tests failed. Falling back to priority-based selection.")
-			fmt.Println("   This may indicate:")
-			fmt.Println("   - Firewall blocking Tailscale ping packets")
-			fmt.Println("   - Tailscale daemon issues")
-			fmt.Println("   - Network configuration problems")
-			fmt.Println("\n   Selecting by Tailscale priority instead...")
-			bestNode = onlineNodes[0]
-		} else {
-			bestNode = testedNodes[0]
+	// Show top candidates if verbose
+	if *verboseFlag {
+		fmt.Printf("\nTop 10 candidates by priority:\n")
+		displayCount := 10
+		if len(onlineNodes) < displayCount {
+			displayCount = len(onlineNodes)
 		}
-	} else {
-		// Use priority-based selection (no latency testing)
-		bestNode = onlineNodes[0]
+		for i := 0; i < displayCount; i++ {
+			node := onlineNodes[i]
+			fmt.Printf("%2d. %s (%s, %s) - Priority: %d\n",
+				i+1,
+				strings.TrimSuffix(node.DNSName, "."),
+				node.City,
+				node.CountryCode,
+				node.Priority)
+		}
 	}
+
+	// Use priority-based selection (Mullvad nodes don't respond to pings)
+	bestNode := onlineNodes[0]
 
 	if *verboseFlag {
 		fmt.Printf("\nSelected Mullvad node:\n")
 		fmt.Printf("  Hostname: %s\n", strings.TrimSuffix(bestNode.DNSName, "."))
 		fmt.Printf("  Location: %s, %s\n", bestNode.City, bestNode.CountryCode)
-		fmt.Printf("  Priority: %d\n", bestNode.Priority)
-		if bestNode.Latency > 0 {
-			fmt.Printf("  Latency: %v\n", bestNode.Latency.Round(time.Millisecond))
-		}
+		fmt.Printf("  Priority: %d (lower is closer)\n", bestNode.Priority)
 		fmt.Printf("  Online: %v\n", bestNode.Online)
 	}
 
@@ -300,19 +293,10 @@ func autoSelectMullvad(ctx context.Context, lc *tailscale.LocalClient) error {
 		return err
 	}
 
-	// Show latency in output if available
-	if bestNode.Latency > 0 {
-		fmt.Printf("WAN is now protected via %s (%s, %s) - Latency: %v\n",
-			strings.TrimSuffix(bestNode.DNSName, "."),
-			bestNode.City,
-			bestNode.CountryCode,
-			bestNode.Latency.Round(time.Millisecond))
-	} else {
-		fmt.Printf("WAN is now protected via %s (%s, %s)\n",
-			strings.TrimSuffix(bestNode.DNSName, "."),
-			bestNode.City,
-			bestNode.CountryCode)
-	}
+	fmt.Printf("WAN is now protected via %s (%s, %s)\n",
+		strings.TrimSuffix(bestNode.DNSName, "."),
+		bestNode.City,
+		bestNode.CountryCode)
 
 	return nil
 }
@@ -384,226 +368,6 @@ func clearExitNode(ctx context.Context, lc *tailscale.LocalClient) error {
 	}
 
 	return nil
-}
-
-// pingNode measures the latency to a Mullvad exit node
-func pingNode(ctx context.Context, lc *tailscale.LocalClient, node *MullvadNode) time.Duration {
-	if len(node.TailscaleIPs) == 0 {
-		if *verboseFlag {
-			fmt.Printf("  %s: No Tailscale IP available\n", strings.TrimSuffix(node.DNSName, "."))
-		}
-		return time.Duration(0) // No IP available
-	}
-
-	// Use the first Tailscale IP
-	targetIP := node.TailscaleIPs[0]
-
-	// Create a timeout context (5 seconds for each ping - increased for better reliability)
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	// Perform disco ping (tests connectivity)
-	result, err := lc.Ping(pingCtx, targetIP, tailcfg.PingDisco)
-	if err != nil {
-		// Always show first few errors to help diagnose issues
-		fmt.Printf("  %s (%s): Ping failed - %v\n",
-			strings.TrimSuffix(node.DNSName, "."),
-			targetIP.String(),
-			err)
-		return time.Duration(0) // Failed ping
-	}
-
-	// Check for ping errors
-	if result.Err != "" {
-		fmt.Printf("  %s: %s\n", strings.TrimSuffix(node.DNSName, "."), result.Err)
-		return time.Duration(0)
-	}
-
-	// Convert latency from seconds to duration
-	latency := time.Duration(result.LatencySeconds * float64(time.Second))
-
-	if *verboseFlag {
-		fmt.Printf("  %s: %v ✓\n", strings.TrimSuffix(node.DNSName, "."), latency.Round(time.Millisecond))
-	} else {
-		fmt.Printf("  %s: %v\n", strings.TrimSuffix(node.DNSName, "."), latency.Round(time.Millisecond))
-	}
-
-	return latency
-}
-
-// testLatencyForNodes tests latency for the top N nodes
-func testLatencyForNodes(ctx context.Context, lc *tailscale.LocalClient, nodes []MullvadNode, maxNodes int) []MullvadNode {
-	if len(nodes) == 0 {
-		return nodes
-	}
-
-	// Limit to maxNodes
-	testCount := len(nodes)
-	if testCount > maxNodes {
-		testCount = maxNodes
-	}
-
-	if *verboseFlag {
-		fmt.Printf("Testing latency for top %d nodes by priority...\n", testCount)
-	}
-
-	// Test latency for each node
-	for i := 0; i < testCount; i++ {
-		nodes[i].Latency = pingNode(ctx, lc, &nodes[i])
-	}
-
-	return nodes
-}
-
-// CountryGroup represents nodes grouped by country
-type CountryGroup struct {
-	CountryCode string
-	Country     string
-	Nodes       []MullvadNode
-	BestLatency time.Duration // Best latency from this country
-}
-
-// groupNodesByCountry groups Mullvad nodes by country code
-func groupNodesByCountry(nodes []MullvadNode) map[string]*CountryGroup {
-	groups := make(map[string]*CountryGroup)
-
-	for _, node := range nodes {
-		if _, exists := groups[node.CountryCode]; !exists {
-			groups[node.CountryCode] = &CountryGroup{
-				CountryCode: node.CountryCode,
-				Country:     node.Country,
-				Nodes:       []MullvadNode{},
-			}
-		}
-		groups[node.CountryCode].Nodes = append(groups[node.CountryCode].Nodes, node)
-	}
-
-	return groups
-}
-
-// testCountryLatency tests one representative node from each country
-// Returns a slice of countries sorted by their best latency
-func testCountryLatency(ctx context.Context, lc *tailscale.LocalClient, countryGroups map[string]*CountryGroup) []*CountryGroup {
-	if *verboseFlag {
-		fmt.Printf("\nPhase 1: Testing one node from each country (%d countries)...\n", len(countryGroups))
-	}
-
-	var countries []*CountryGroup
-
-	for _, group := range countryGroups {
-		// Test the highest priority (first) node from this country
-		if len(group.Nodes) > 0 {
-			testNode := &group.Nodes[0]
-			latency := pingNode(ctx, lc, testNode)
-			testNode.Latency = latency
-			group.BestLatency = latency
-
-			if *verboseFlag && latency > 0 {
-				fmt.Printf("  %s (%s): %v\n", group.Country, group.CountryCode, latency.Round(time.Millisecond))
-			}
-		}
-		countries = append(countries, group)
-	}
-
-	// Sort countries by best latency
-	sort.Slice(countries, func(i, j int) bool {
-		// Countries with 0 latency (failed) go to the end
-		if countries[i].BestLatency == 0 && countries[j].BestLatency != 0 {
-			return false
-		}
-		if countries[i].BestLatency != 0 && countries[j].BestLatency == 0 {
-			return true
-		}
-		// Both have valid latency
-		if countries[i].BestLatency != 0 && countries[j].BestLatency != 0 {
-			return countries[i].BestLatency < countries[j].BestLatency
-		}
-		// Both failed, sort by country code
-		return countries[i].CountryCode < countries[j].CountryCode
-	})
-
-	return countries
-}
-
-// testTopCountriesInDepth tests the top N nodes in each of the top M countries
-func testTopCountriesInDepth(ctx context.Context, lc *tailscale.LocalClient, countries []*CountryGroup, topCountries int, nodesPerCountry int) []MullvadNode {
-	var allNodes []MullvadNode
-
-	// Limit to topCountries
-	testCountryCount := len(countries)
-	if testCountryCount > topCountries {
-		testCountryCount = topCountries
-	}
-
-	if *verboseFlag {
-		fmt.Printf("\nPhase 2: Testing top %d nodes in each of the top %d countries...\n", nodesPerCountry, testCountryCount)
-	}
-
-	for i := 0; i < testCountryCount; i++ {
-		country := countries[i]
-
-		// Skip countries that failed initial test
-		if country.BestLatency == 0 {
-			continue
-		}
-
-		if *verboseFlag {
-			fmt.Printf("\nTesting nodes in %s (%s):\n", country.Country, country.CountryCode)
-		}
-
-		// Test up to nodesPerCountry nodes from this country
-		testCount := len(country.Nodes)
-		if testCount > nodesPerCountry {
-			testCount = nodesPerCountry
-		}
-
-		for j := 0; j < testCount; j++ {
-			node := &country.Nodes[j]
-
-			// Skip if already tested (first node was tested in phase 1)
-			if node.Latency == 0 {
-				node.Latency = pingNode(ctx, lc, node)
-			} else if *verboseFlag {
-				fmt.Printf("  %s: %v (from Phase 1)\n",
-					strings.TrimSuffix(node.DNSName, "."),
-					node.Latency.Round(time.Millisecond))
-			}
-
-			allNodes = append(allNodes, *node)
-		}
-	}
-
-	// Sort all tested nodes by latency
-	sort.Slice(allNodes, func(i, j int) bool {
-		if allNodes[i].Latency == 0 && allNodes[j].Latency != 0 {
-			return false
-		}
-		if allNodes[i].Latency != 0 && allNodes[j].Latency == 0 {
-			return true
-		}
-		if allNodes[i].Latency != 0 && allNodes[j].Latency != 0 {
-			return allNodes[i].Latency < allNodes[j].Latency
-		}
-		return allNodes[i].Priority < allNodes[j].Priority
-	})
-
-	return allNodes
-}
-
-// smartLatencySelection performs two-phase latency testing:
-// Phase 1: Test one node per country
-// Phase 2: Deep test top nodes in fastest countries
-func smartLatencySelection(ctx context.Context, lc *tailscale.LocalClient, nodes []MullvadNode) []MullvadNode {
-	// Group nodes by country
-	countryGroups := groupNodesByCountry(nodes)
-
-	// Phase 1: Test one node from each country
-	sortedCountries := testCountryLatency(ctx, lc, countryGroups)
-
-	// Phase 2: Deep test top 5 nodes in top 5 countries
-	testedNodes := testTopCountriesInDepth(ctx, lc, sortedCountries, 5, 5)
-
-	return testedNodes
 }
 
 // handlePermissionError checks if the error is permission-related and provides helpful guidance
